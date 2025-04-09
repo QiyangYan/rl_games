@@ -21,6 +21,7 @@ from tensorboardX import SummaryWriter
 import torch 
 from torch import nn
 import torch.distributed as dist
+from termcolor import cprint
  
 from time import sleep
 
@@ -41,6 +42,9 @@ def rescale_actions(low, high, action):
     m = (high + low) / 2.0
     scaled_action = action * d + m
     return scaled_action
+
+def logistic_fn(step, k=0.001, C=18000):
+    return 1/(1 + math.exp(-k * (step-C)))
 
 
 class A2CBase(BaseAlgorithm):
@@ -277,7 +281,7 @@ class A2CBase(BaseAlgorithm):
         if self.truncate_grads:
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-
+        
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -313,11 +317,15 @@ class A2CBase(BaseAlgorithm):
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
     def set_eval(self):
+        if self.residual:
+            self.model_base.eval()
         self.model.eval()
         if self.normalize_rms_advantage:
             self.advantage_mean_std.eval()
 
     def set_train(self):
+        if self.residual:
+            self.model_base.eval()
         self.model.train()
         if self.normalize_rms_advantage:
             self.advantage_mean_std.train()
@@ -333,10 +341,13 @@ class A2CBase(BaseAlgorithm):
         
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
-
-    def get_action_values(self, obs):
+    
+    def get_action_values_test(self, obs, residual=False):
         processed_obs = self._preproc_obs(obs['obs'])
-        self.model.eval()
+        if residual: # base policy
+            self.model_base.eval() 
+        else: # trained policy: DAPG pretrained policy, residual policy, rl policy
+            self.model.eval() 
         input_dict = {
             'is_train': False,
             'prev_actions': None, 
@@ -345,7 +356,10 @@ class A2CBase(BaseAlgorithm):
         }
 
         with torch.no_grad():
-            res_dict = self.model(input_dict)
+            if residual:
+                res_dict = self.model_base(input_dict)
+            else:
+                res_dict = self.model(input_dict)
             if self.has_central_value:
                 states = obs['states']
                 input_dict = {
@@ -355,6 +369,45 @@ class A2CBase(BaseAlgorithm):
                 value = self.get_central_value(input_dict)
                 res_dict['values'] = value
         return res_dict
+
+    def get_action_values(self, obs, residual=False):
+        composed_action = None
+        processed_obs = self._preproc_obs(obs['obs'])
+        if residual:
+            self.model_base.eval() 
+        self.model.eval()
+        input_dict = {
+            'is_train': False,
+            'prev_actions': None, 
+            'obs' : processed_obs,
+            'rnn_states' : self.rnn_states
+        }
+
+        with torch.no_grad():            
+            # base policy for residual rl policy
+            res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
+            if residual:
+                # base action
+                res_dict_base = self.model_base(input_dict)
+                base_action = res_dict_base['actions']
+                residual_action = res_dict['actions']
+                
+                # combine base and residual action
+                composed_action = base_action + residual_action * self.residual_weighting
+
+            if self.has_central_value:
+                states = obs['states']
+                input_dict = {
+                    'is_train': False,
+                    'states' : states,
+                }
+                value = self.get_central_value(input_dict)
+                res_dict['values'] = value
+        
+        if residual:
+            return res_dict, composed_action
+        else:
+            return res_dict
 
     def get_values(self, obs):
         with torch.no_grad():
@@ -412,9 +465,16 @@ class A2CBase(BaseAlgorithm):
             num_seqs = self.horizon_length // self.seq_len
             assert((self.horizon_length * total_agents // self.num_minibatches) % self.seq_len == 0)
             self.mb_rnn_states = [torch.zeros((num_seqs, s.size()[0], total_agents, s.size()[2]), dtype = torch.float32, device=self.ppo_device) for s in self.rnn_states]
+        
+        if self.residual:
+            if self.is_rnn_residual:
+                raise NotImplementedError
 
-    def init_rnn_from_model(self, model):
-        self.is_rnn = self.model.is_rnn()
+    def init_rnn_from_model(self, model, residual=False):
+        if residual:
+            self.is_rnn_residual = self.model_base.is_rnn()
+        else:
+            self.is_rnn = self.model.is_rnn()
 
     def cast_obs(self, obs):
         if isinstance(obs, torch.Tensor):
@@ -555,17 +615,18 @@ class A2CBase(BaseAlgorithm):
 
     def set_full_state_weights(self, weights):
         self.set_weights(weights)
-        self.epoch_num = weights['epoch']
-        if self.has_central_value:
-            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
-        self.optimizer.load_state_dict(weights['optimizer'])
-        self.frame = weights.get('frame', 0)
-        self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+        if not self.residual:
+            self.epoch_num = weights['epoch']
+            if self.has_central_value:
+                self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
+            self.optimizer.load_state_dict(weights['optimizer'])
+            self.frame = weights.get('frame', 0)
+            self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 
-        env_state = weights.get('env_state', None)
+            env_state = weights.get('env_state', None)
 
-        if self.vec_env is not None:
-            self.vec_env.set_env_state(env_state)
+            if self.vec_env is not None:
+                self.vec_env.set_env_state(env_state)
 
     def get_weights(self):
         state = self.get_stats_weights()
@@ -595,10 +656,20 @@ class A2CBase(BaseAlgorithm):
             self.model.value_mean_std.load_state_dict(weights['reward_mean_std'])
         if self.mixed_precision and 'scaler' in weights:
             self.scaler.load_state_dict(weights['scaler'])
+    
+    def set_stats_weights_base(self, weights):
+        if self.normalize_input and 'running_mean_std' in weights:
+            self.model_base.running_mean_std.load_state_dict(weights['running_mean_std'])
+        if self.normalize_value and 'normalize_value' in weights:
+            self.model_base.value_mean_std.load_state_dict(weights['reward_mean_std'])
 
     def set_weights(self, weights):
-        self.model.load_state_dict(weights['model'])
-        self.set_stats_weights(weights)
+        if self.residual:
+            self.model_base.load_state_dict(weights['model'])
+            self.set_stats_weights_base(weights)
+        else:
+            self.model.load_state_dict(weights['model'])
+            self.set_stats_weights(weights)
 
     def _preproc_obs(self, obs_batch):
         if type(obs_batch) is dict:
@@ -614,14 +685,18 @@ class A2CBase(BaseAlgorithm):
         return obs_batch
 
     def play_steps(self):
+        cprint("Running Play Mode", "yellow")
         update_list = self.update_list
 
         step_time = 0.0
+        composed_action = None
 
         for n in range(self.horizon_length):
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
+            elif self.residual:
+                res_dict, composed_action = self.get_action_values(self.obs, self.residual)
             else:
                 res_dict = self.get_action_values(self.obs)
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
@@ -632,8 +707,12 @@ class A2CBase(BaseAlgorithm):
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
+
             step_time_start = time.time()
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
+            if self.residual:
+                self.obs, rewards, self.dones, infos = self.env_step(composed_action)
+            else:
+                self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
             step_time_end = time.time()
 
             step_time += (step_time_end - step_time_start)
@@ -691,7 +770,7 @@ class A2CBase(BaseAlgorithm):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs)
+                res_dict = self.get_action_values(self.obs, self.residual)
             self.rnn_states = res_dict['rnn_states']
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones.byte())
@@ -1002,11 +1081,24 @@ class ContinuousA2CBase(A2CBase):
         self.actions_num = action_space.shape[0]
         self.bounds_loss_coef = self.config.get('bounds_loss_coef', None)
 
+        self.DAPG = self.config.get('use_DAPG', False)
+        self.with_pretrain = self.config.get('with_pretrain', None)
+        self.bc_loss_coef = self.config.get('bc_loss_coef', None)
+        self.bc_batch_size = self.config.get('bc_batch_size', None)
+
+        self.residual = self.config.get('use_residual', False)
+        self.residual_weighting = self.config.get('residual_weighting', None)
+        self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
+
         self.clip_actions = self.config.get('clip_actions', True)
 
         # todo introduce device instead of cuda()
-        self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
-        self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
+        if self.residual:
+            self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)[:13]
+            self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)[:13]
+        else:
+            self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
+            self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
    
     def preprocess_actions(self, actions):
         if self.clip_actions:
@@ -1153,6 +1245,24 @@ class ContinuousA2CBase(A2CBase):
             dataset_dict['rnn_masks'] = rnn_masks
             self.central_value_net.update_dataset(dataset_dict)
 
+    def run_deterministic_policy(self):
+        """
+        Runs the pre-trained policy without any RL training.
+        """
+        print("Running trained policy in deterministic mode...")
+        self.obs = self.env_reset()
+
+        while True:
+            with torch.no_grad():
+                res_dict = self.get_action_values_test(self.obs, self.residual)  # Get policy action
+                action = res_dict['mus']  # Use mean action (no noise)
+            
+            self.obs, rewards, dones, infos = self.env_step(action)
+            
+            if dones.any():
+                print("Episode finished. Restarting...")
+                self.obs = self.env_reset()
+
     def train(self):
         self.init_tensors()
         self.last_mean_rewards = -100500
@@ -1167,6 +1277,42 @@ class ContinuousA2CBase(A2CBase):
             model_params = [self.model.state_dict()]
             dist.broadcast_object_list(model_params, 0)
             self.model.load_state_dict(model_params[0])
+
+        ### STEP 1: PRETRAIN WITH BEHAVIOR CLONING (BC)
+        if self.DAPG and self.with_pretrain:  # Ensure DAPG is enabled for BC pretraining
+            ''' Start pre-training '''
+            cprint("Starting pretraining with behavior cloning...", "green")
+            for pretrain_step in range(self.config.get("pretrain_epochs", 10)):  # Number of pretraining epochs
+                self.model.train()
+                self.optimizer.zero_grad()
+                bc_loss, bc_loss_valid = self.compute_bc_loss()  # Compute BC loss from expert dataset
+                bc_loss.backward()
+                self.optimizer.step()
+                if pretrain_step % 1000 == 0:
+                    print(f"Pretrain Step {pretrain_step + 1}: BC Loss = {bc_loss.item():.6f}, BC Loss = {bc_loss_valid.item():.6f}")
+
+            cprint("Pretraining complete. Starting RL training...", "green")
+            bc_loss, bc_loss_valid = self.compute_bc_loss(plot=True)  # Compute BC loss from expert dataset
+            cprint(f"Pretrain Step {pretrain_step + 1}: BC Loss = {bc_loss.item():.6f}, BC Loss = {bc_loss_valid.item():.6f}", "green")
+
+
+            ''' Test pretrained policy'''
+            # print("Skipping RL training. Running the trained policy in deterministic mode.")
+            # self.model.eval()  # Switch model to inference mode (no exploration)
+            
+            # # Run policy in deterministic mode
+            # self.run_deterministic_policy()
+
+            # return  # Exit training loop
+        
+        if self.residual:
+            cprint("Using residual model", "green")
+
+            ''' Test base policy'''
+            # print("Skipping RL training. Running the trained policy in deterministic mode.")
+            # self.model_base.eval()  # Switch model to inference mode (no exploration)
+            # self.run_deterministic_policy()
+            # return  # Exit training loop
 
         while True:
             epoch_num = self.update_epoch()

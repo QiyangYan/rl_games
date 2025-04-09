@@ -5,16 +5,23 @@ from rl_games.algos_torch import central_value
 from rl_games.common import common_losses
 from rl_games.common import datasets
 
+from rl_games.common.data_sampler import Data_Sampler
+
 from torch import optim
 import torch 
 from torch import nn
 import numpy as np
 import gym
+import matplotlib.pyplot as plt
 
 class A2CAgent(a2c_common.ContinuousA2CBase):
     def __init__(self, base_name, params):
         a2c_common.ContinuousA2CBase.__init__(self, base_name, params)
+        if self.DAPG:
+            data_sampler = Data_Sampler(self.ppo_device)
+            self.bc_buffer = data_sampler
         obs_shape = self.obs_shape
+        
         build_config = {
             'actions_num' : self.actions_num,
             'input_shape' : obs_shape,
@@ -24,7 +31,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             'normalize_input': self.normalize_input,
 
         }
-        
+            
         self.model = self.network.build(build_config)
         self.model.to(self.ppo_device)
         self.states = None
@@ -32,6 +39,16 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.last_lr = float(self.last_lr)
         self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
         self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        
+        if self.residual:
+            build_config_base = build_config.copy()
+            # build_config_base['actions_num'] = int(self.actions_num / 2)
+            self.model_base = self.network.build(build_config_base)
+            self.model_base.to(self.ppo_device)
+            self.init_rnn_from_model(self.model, self.residual)
+            self.model_base.eval()
+            for param in self.model_base.parameters():
+                param.requires_grad = False
 
         if self.has_central_value:
             cv_config = {
@@ -125,7 +142,12 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            if self.DAPG:
+                bc_loss, val_bc_loss = self.compute_bc_loss()
+                loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef + bc_loss * self.bc_loss_coef
+                # print("BC loss:", bc_loss)
+            else:
+                loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -176,5 +198,68 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         else:
             b_loss = 0
         return b_loss
+    
+    def compute_bc_loss(self, plot=False):
+        if not self.bc_buffer:
+            return torch.tensor(0).to(self.ppo_device), torch.tensor(0).to(self.ppo_device)
+
+        buffer = self.bc_buffer
+        policy = self.model
+        batch_size = self.bc_batch_size
+
+        policy.train()
+        
+        # Sample states and actions from buffer
+        state, act = buffer.sample_idxs(batch_size)
+
+        # Debugging shape before forward pass
+        # print(f"State shape before processing: {state.shape}")  # Should be (batch_size, num_envs, obs_dim)
+        # print(f"Action shape before processing: {act.shape}")  # Should be (batch_size, num_envs, action_dim)
+
+        # Ensure state shape is correct for the policy network
+        if len(state.shape) == 3:  # (batch_size, num_envs, obs_dim)
+            state = state.view(batch_size * state.shape[1], -1)  # Flatten envs dimension
+
+        if len(act.shape) == 3:  # (batch_size, num_envs, action_dim)
+            act = act.view(batch_size * act.shape[1], -1)  # Flatten envs dimension
+
+        # print(f"State shape after flattening: {state.shape}")  # (batch_size * num_envs, obs_dim)
+        # print(f"Action shape after flattening: {act.shape}")  # (batch_size * num_envs, action_dim)
+
+        # Forward pass with dictionary input for policy network
+        res_dict = policy({'obs': state, 'is_train': False})
+
+        if 'mus' in res_dict:
+            predicted_actions = res_dict['mus']  # Mean action predictions
+        else:
+            raise ValueError("Model does not output 'mus'. Check network output.")
+
+        # Ensure action shape matches predicted actions before loss calculation
+        if predicted_actions.shape != act.shape:
+            raise ValueError(f"Mismatch: Predicted actions {predicted_actions.shape}, Actions {act.shape}")
+
+        # Compute Behavior Cloning Loss (MSE Loss)
+        bc_loss = torch.nn.MSELoss()(predicted_actions, act)
+
+        with torch.no_grad():
+            state, act = buffer.sample_idxs(batch_size, train=False)
+            res_dict = policy({'obs': state, 'is_train': False})
+            if 'mus' in res_dict:
+                predicted_actions = res_dict['mus']  # Mean action predictions
+            else:
+                raise ValueError("Model does not output 'mus'. Check network output.")
+            bc_loss_valid = torch.nn.MSELoss()(predicted_actions, act)
+
+            if plot==True:
+                plt.figure(figsize=(8, 5))
+                plt.scatter(range(len(act[:, 0].cpu().numpy())), act[:, 0].cpu().numpy(), label="Ground Truth Actions", color="blue", linestyle="-")
+                plt.scatter(range(len(predicted_actions[:, 0].cpu().numpy())), predicted_actions[:, 0].cpu().numpy(), label="Predicted Actions", color="red", linestyle="--")
+                plt.xlabel("Sample Index")
+                plt.ylabel("Action Value (Dimension 0)")
+                plt.title("Behavior Cloning - Predicted vs Ground Truth Actions")
+                plt.legend()
+                plt.show()
+
+        return bc_loss, bc_loss_valid
 
 

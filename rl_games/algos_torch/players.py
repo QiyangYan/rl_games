@@ -18,6 +18,8 @@ def rescale_actions(low, high, action):
 class PpoPlayerContinuous(BasePlayer):
     def __init__(self, params):
         BasePlayer.__init__(self, params)
+        self.residual = self.config.get('use_residual', False)
+        self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
@@ -41,6 +43,13 @@ class PpoPlayerContinuous(BasePlayer):
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
+        if self.residual:
+            build_config_base = config.copy()
+            self.model_base = self.network.build(build_config_base)
+            self.model_base.to(self.device)
+            self.model_base.eval()
+            self.is_rnn_residual = self.model_base.is_rnn()
+        
     def get_action(self, obs, is_determenistic = False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
@@ -53,6 +62,9 @@ class PpoPlayerContinuous(BasePlayer):
         }
         with torch.no_grad():
             res_dict = self.model(input_dict)
+            if self.residual:
+                res_dict_base = self.model_base(input_dict)
+
         mu = res_dict['mus']
         action = res_dict['actions']
         self.states = res_dict['rnn_states']
@@ -62,6 +74,22 @@ class PpoPlayerContinuous(BasePlayer):
             current_action = action
         if self.has_batch_dimension == False:
             current_action = torch.squeeze(current_action.detach())
+
+        if self.residual:
+            base_mu = res_dict_base['mus']
+            base_action = res_dict_base['actions']
+            if is_determenistic:
+                current_action_base = base_mu
+            else:
+                current_action_base = base_action
+            if self.has_batch_dimension == False:
+                current_action_base = torch.squeeze(current_action.detach())
+
+            # print(current_action)
+
+            composed_action = current_action_base + current_action * 0.5
+            current_action = composed_action
+
 
         if self.clip_actions:
             return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
@@ -73,6 +101,11 @@ class PpoPlayerContinuous(BasePlayer):
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+
+        if self.residual:
+            fn = self.base_policy_checkpoint 
+            checkpoint_base = torch_ext.load_checkpoint(fn)
+            self.model_base.load_state_dict(checkpoint_base['model'])
 
     def reset(self):
         self.init_rnn()
