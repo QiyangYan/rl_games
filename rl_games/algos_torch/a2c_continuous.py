@@ -50,6 +50,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             for param in self.model_base.parameters():
                 param.requires_grad = False
 
+            self.restore_residual()
+
         if self.has_central_value:
             cv_config = {
                 'state_shape' : self.state_shape, 
@@ -88,7 +90,11 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
-        self.set_full_state_weights(checkpoint)
+        self.set_full_state_weights(checkpoint, residual=False)
+
+    def restore_residual(self):
+        base_checkpoint = torch_ext.load_checkpoint(self.base_policy_checkpoint)
+        self.set_full_state_weights(base_checkpoint, residual=True)
 
     def get_masked_action_values(self, obs, action_masks):
         assert False

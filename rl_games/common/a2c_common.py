@@ -613,9 +613,9 @@ class A2CBase(BaseAlgorithm):
 
         return state
 
-    def set_full_state_weights(self, weights):
-        self.set_weights(weights)
-        if not self.residual:
+    def set_full_state_weights(self, weights, residual):
+        self.set_weights(weights, residual)
+        if not residual:
             self.epoch_num = weights['epoch']
             if self.has_central_value:
                 self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
@@ -663,8 +663,8 @@ class A2CBase(BaseAlgorithm):
         if self.normalize_value and 'normalize_value' in weights:
             self.model_base.value_mean_std.load_state_dict(weights['reward_mean_std'])
 
-    def set_weights(self, weights):
-        if self.residual:
+    def set_weights(self, weights, residual):
+        if residual:
             self.model_base.load_state_dict(weights['model'])
             self.set_stats_weights_base(weights)
         else:
