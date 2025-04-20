@@ -357,6 +357,7 @@ class A2CBase(BaseAlgorithm):
 
         with torch.no_grad():
             if residual:
+                input_dict['obs'] = input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
                 res_dict = self.model_base(input_dict)
             else:
                 res_dict = self.model(input_dict)
@@ -388,6 +389,7 @@ class A2CBase(BaseAlgorithm):
             res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
             if residual:
                 # base action
+                input_dict['obs'] = input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
                 res_dict_base = self.model_base(input_dict)
                 base_action = res_dict_base['actions']
                 residual_action = res_dict['actions']
@@ -1089,6 +1091,7 @@ class ContinuousA2CBase(A2CBase):
         self.residual = self.config.get('use_residual', False)
         self.residual_weighting = self.config.get('residual_weighting', None)
         self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
+        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
 
         self.clip_actions = self.config.get('clip_actions', True)
 

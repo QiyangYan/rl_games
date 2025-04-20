@@ -6,6 +6,7 @@ import gym
 import torch 
 from torch import nn
 import numpy as np
+from termcolor import cprint
 
 
 def rescale_actions(low, high, action):
@@ -19,7 +20,11 @@ class PpoPlayerContinuous(BasePlayer):
     def __init__(self, params):
         BasePlayer.__init__(self, params)
         self.residual = self.config.get('use_residual', False)
+        cprint(f'Using residual policy: {self.residual}', 'red')
         self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
+        self.residual_weighting = self.config.get('residual_weighting', None)
+        self.more_info_for_residual = self.config.get('more_info_for_residual', False)
+        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
@@ -45,6 +50,8 @@ class PpoPlayerContinuous(BasePlayer):
 
         if self.residual:
             build_config_base = config.copy()
+            build_config_base['input_shape'] = (self.base_policy_obs_shape, )
+            assert build_config_base['input_shape']==(self.base_policy_obs_shape, ), f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
             self.model_base = self.network.build(build_config_base)
             self.model_base.to(self.device)
             self.model_base.eval()
@@ -63,6 +70,7 @@ class PpoPlayerContinuous(BasePlayer):
         with torch.no_grad():
             res_dict = self.model(input_dict)
             if self.residual:
+                input_dict['obs'] = input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
                 res_dict_base = self.model_base(input_dict)
 
         mu = res_dict['mus']
@@ -87,9 +95,10 @@ class PpoPlayerContinuous(BasePlayer):
 
             # print(current_action)
 
-            composed_action = current_action_base + current_action * 0.5
+            composed_action = current_action_base + current_action * self.residual_weighting
             current_action = composed_action
 
+        # import ipdb; ipdb.set_trace()
 
         if self.clip_actions:
             return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
@@ -99,6 +108,7 @@ class PpoPlayerContinuous(BasePlayer):
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.model.load_state_dict(checkpoint['model'])
+        # from ipdb import set_trace; set_trace()
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
