@@ -7,6 +7,7 @@ import torch
 from torch import nn
 import numpy as np
 from termcolor import cprint
+import copy
 
 
 def rescale_actions(low, high, action):
@@ -21,10 +22,17 @@ class PpoPlayerContinuous(BasePlayer):
         BasePlayer.__init__(self, params)
         self.residual = self.config.get('use_residual', False)
         cprint(f'Using residual policy: {self.residual}', 'red')
-        self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
-        self.residual_weighting = self.config.get('residual_weighting', None)
         self.more_info_for_residual = self.config.get('more_info_for_residual', False)
+
+        self.residual = self.config.get('use_residual', False)
+        self.residual_weighting = self.config.get('residual_weighting', None)
+        self.enable_warmup = self.config.get('enable_warmup', None)
+        self.num_warmup_steps = self.config.get('num_warmup_steps', 1000)
+        self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
         self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
+        self.mask_action = self.config.get('mask_action', None)
+        self.action_dim = self.config.get('action_dim', None)
+
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
@@ -68,10 +76,26 @@ class PpoPlayerContinuous(BasePlayer):
             'rnn_states' : self.states
         }
         with torch.no_grad():
-            res_dict = self.model(input_dict)
             if self.residual:
-                input_dict['obs'] = input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
-                res_dict_base = self.model_base(input_dict)
+                # base action
+                base_input_dict = copy.deepcopy(input_dict)
+                base_input_dict['obs'] = base_input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
+                res_dict_base = self.model_base(base_input_dict)
+                base_mu = res_dict_base['mus']
+                base_action = res_dict_base['actions']
+                if is_determenistic:
+                    current_action_base = base_mu
+                else:
+                    current_action_base = base_action
+                if self.has_batch_dimension == False:
+                    current_action_base = torch.squeeze(current_action.detach())
+
+                # resiudal action
+                input_dict['obs'][:, -self.action_dim:] = base_action # replace the base action placeholder with the actual base action
+                res_dict = self.model(input_dict)
+            else:
+                res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
+
 
         mu = res_dict['mus']
         action = res_dict['actions']
@@ -84,19 +108,15 @@ class PpoPlayerContinuous(BasePlayer):
             current_action = torch.squeeze(current_action.detach())
 
         if self.residual:
-            base_mu = res_dict_base['mus']
-            base_action = res_dict_base['actions']
-            if is_determenistic:
-                current_action_base = base_mu
-            else:
-                current_action_base = base_action
-            if self.has_batch_dimension == False:
-                current_action_base = torch.squeeze(current_action.detach())
+            # mask residual action, only consider hand action
+            if self.mask_action:
+                assert current_action.shape[-1] == self.action_dim
+                current_action[:self.mask_action] = 0.0
 
-            # print(current_action)
-
+            # combine base and residual action
             composed_action = current_action_base + current_action * self.residual_weighting
             current_action = composed_action
+            cprint(f"self.residual_weighting: {self.residual_weighting}", "red")
 
         # import ipdb; ipdb.set_trace()
 

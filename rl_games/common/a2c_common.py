@@ -15,6 +15,7 @@ from rl_games.interfaces.base_algorithm import  BaseAlgorithm
 import numpy as np
 import time
 import gym
+import math
 
 from datetime import datetime
 from tensorboardX import SummaryWriter
@@ -45,6 +46,52 @@ def rescale_actions(low, high, action):
 
 def logistic_fn(step, k=0.001, C=18000):
     return 1/(1 + math.exp(-k * (step-C)))
+
+
+""" 
+This warmup the ratio of the residual action added into base action
+"""
+
+def linear_warmup(step, T):
+    return min(1.0, step / max(1, T))
+
+def cosine_warmup(step, T):
+    # starts at 0, ends at 1; slower at the start, smoother overall
+    s = min(1.0, step / max(1, T))
+    return 0.5 - 0.5 * math.cos(math.pi * s)
+
+def exp_warmup(step, T, k=5.0):
+    # faster growth later; k controls steepness
+    s = min(1.0, step / max(1, T))
+    return (math.exp(k*s) - 1.0) / (math.exp(k) - 1.0)
+
+class WarmupScheduler(schedulers.RLScheduler):
+    def __init__(self, kl_threshold=0.008, warmup_steps=8192, start_lr=1e-6, end_lr=1e-4, use_epochs=True):
+        super().__init__()
+        self.kl_threshold = kl_threshold
+        self.warmup_steps = warmup_steps
+        self.start_lr = start_lr
+        self.end_lr = end_lr
+        self.min_lr = 1e-6
+        self.max_lr = 1e-2
+        self.use_epochs = use_epochs
+
+    def update(self, current_lr, entropy_coef, epoch, frames, kl_dist, **kwargs):
+        if self.use_epochs:
+            steps = epoch
+        else:
+            steps = frames
+
+        if steps <= self.warmup_steps:
+            scaled_lr = self.start_lr + (self.end_lr - self.start_lr) * (steps / self.warmup_steps)
+            return scaled_lr, entropy_coef
+
+        lr = current_lr
+        if kl_dist > (2.0 * self.kl_threshold):
+            lr = max(current_lr / 1.5, self.min_lr)
+        elif kl_dist < (0.5 * self.kl_threshold):
+            lr = min(current_lr * 1.5, self.max_lr)
+        return lr, entropy_coef
 
 
 class A2CBase(BaseAlgorithm):
@@ -386,16 +433,41 @@ class A2CBase(BaseAlgorithm):
 
         with torch.no_grad():            
             # base policy for residual rl policy
-            res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
             if residual:
                 # base action
-                input_dict['obs'] = input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
-                res_dict_base = self.model_base(input_dict)
+                base_input_dict = copy.deepcopy(input_dict)
+                base_input_dict['obs'] = base_input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
+                assert base_input_dict['obs'].shape[-1] == self.base_policy_obs_shape, f"Expected {self.base_policy_obs_shape}, but got {base_input_dict['obs'].shape[-1]}"
+                res_dict_base = self.model_base(base_input_dict)
                 base_action = res_dict_base['actions']
+
+                # residual action
+                residual_input_dict = copy.deepcopy(input_dict)
+                residual_input_dict['obs'][:, -self.action_dim:] = base_action
+                residual_input_dict['obs'] = residual_input_dict['obs'][:, self.base_policy_obs_shape:] # check obs size
+                assert residual_input_dict['obs'].shape[-1] == self.residual_obs_shape, f"Expected {self.residual_obs_shape}, but got {residual_input_dict['obs'].shape[-1]}"
+
+                res_dict = self.model(residual_input_dict)
                 residual_action = res_dict['actions']
-                
+
+                # mask residual action, only consider hand action
+                if self.mask_action:
+                    assert residual_action.shape[-1] == self.action_dim
+                    residual_action[:self.mask_action] = 0.0
+
+                # add action wrapper
+                if self.enable_residual_distance:
+                    if residual_input_dict['obs'][:, 12] > self.enable_residual_distance_threshold:
+                        residual_weighting = 0
+                else:
+                    residual_weighting =self.residual_weighting
+
                 # combine base and residual action
-                composed_action = base_action + residual_action * self.residual_weighting
+                composed_action = base_action + residual_action * residual_weighting
+                cprint(f"self.residual_weighting: {self.residual_weighting}", "red")
+
+            else:
+                res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
 
             if self.has_central_value:
                 states = obs['states']
@@ -699,9 +771,10 @@ class A2CBase(BaseAlgorithm):
                 res_dict = self.get_masked_action_values(self.obs, masks)
             elif self.residual:
                 res_dict, composed_action = self.get_action_values(self.obs, self.residual)
+                self.experience_buffer.update_data('obses', n, self.obs['obs'][:, self.base_policy_obs_shape:])
             else:
                 res_dict = self.get_action_values(self.obs)
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+                self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
 
             for k in update_list:
@@ -1089,9 +1162,18 @@ class ContinuousA2CBase(A2CBase):
         self.bc_batch_size = self.config.get('bc_batch_size', None)
 
         self.residual = self.config.get('use_residual', False)
+        self.test_residual_base_policy = self.config.get('test_residual_base_policy', False)
         self.residual_weighting = self.config.get('residual_weighting', None)
+        self.enable_warmup = self.config.get('enable_warmup', None)
+        self.num_warmup_steps = self.config.get('num_warmup_steps', 1000)
         self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
-        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
+        self.env_obs_type = self.config.get('env_obs_type', None)
+        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', None)
+        self.residual_obs_shape = self.config.get('residual_obs_shape', None)
+        self.mask_action = self.config.get('mask_action', None)
+        self.action_dim = self.config.get('action_dim', None)
+        self.enable_residual_distance_threshold = self.config.get('enable_residual_distance_threshold', None)
+        self.enable_residual_distance = self.config.get('enable_residual_distance', False)
 
         self.clip_actions = self.config.get('clip_actions', True)
 
@@ -1308,14 +1390,14 @@ class ContinuousA2CBase(A2CBase):
 
             # return  # Exit training loop
         
-        if self.residual:
+        if self.residual and self.test_residual_base_policy:
             cprint("Using residual model", "green")
 
             ''' Test base policy'''
-            # print("Skipping RL training. Running the trained policy in deterministic mode.")
-            # self.model_base.eval()  # Switch model to inference mode (no exploration)
-            # self.run_deterministic_policy()
-            # return  # Exit training loop
+            print("Skipping RL training. Running the trained policy in deterministic mode.")
+            self.model_base.eval()  # Switch model to inference mode (no exploration)
+            self.run_deterministic_policy()
+            return  # Exit training loop
 
         while True:
             epoch_num = self.update_epoch()
@@ -1334,6 +1416,9 @@ class ContinuousA2CBase(A2CBase):
                 scaled_play_time = self.num_agents * play_time
                 curr_frames = self.curr_frames * self.rank_size if self.multi_gpu else self.curr_frames
                 self.frame += curr_frames
+
+                if self.residual and self.enable_warmup:
+                    self.residual_weighting = cosine_warmup(self.frame, curr_frames * self.num_warmup_steps)
 
                 if self.print_stats:
                     step_time = max(step_time, 1e-6)
@@ -1395,6 +1480,7 @@ class ContinuousA2CBase(A2CBase):
                 update_time = 0
 
             if self.multi_gpu:
+                # TODO: add broadcast for residual weighting
                 should_exit_t = torch.tensor(should_exit, device=self.device).float()
                 dist.broadcast(should_exit_t, 0)
                 should_exit = should_exit_t.float().item()

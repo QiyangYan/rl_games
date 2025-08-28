@@ -43,7 +43,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         if self.residual:
             build_config_base = build_config.copy()
             build_config_base['input_shape'] = (self.base_policy_obs_shape, )
-            assert build_config_base['input_shape']==self.base_policy_obs_shape, f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
+            # assert build_config_base['input_shape']==self.base_policy_obs_shape, f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
             # build_config_base['actions_num'] = int(self.actions_num / 2)
             self.model_base = self.network.build(build_config_base)
             self.model_base.to(self.ppo_device)
