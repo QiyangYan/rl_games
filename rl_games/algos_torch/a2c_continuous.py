@@ -32,17 +32,23 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         }
             
-        self.model = self.network.build(build_config)
-        self.model.to(self.ppo_device)
-        self.states = None
-        self.init_rnn_from_model(self.model)
-        self.last_lr = float(self.last_lr)
-        self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
-        self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
         
         if self.residual:
+            # for residual policy
+            build_config['actions_num'] = self.residual_actions_dim
+
+            self.model = self.network.build(build_config)
+            self.model.to(self.ppo_device)
+            self.states = None
+            self.init_rnn_from_model(self.model)
+            self.last_lr = float(self.last_lr)
+            self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
+            self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+            
+            # for base policy
             build_config_base = build_config.copy()
             build_config_base['input_shape'] = (self.base_policy_obs_shape, )
+            build_config_base['actions_num'] = self.actions_num
             # assert build_config_base['input_shape']==self.base_policy_obs_shape, f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
             # build_config_base['actions_num'] = int(self.actions_num / 2)
             self.model_base = self.network.build(build_config_base)
@@ -53,10 +59,22 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 param.requires_grad = False
 
             self.restore_residual()
+        else:
+            # for one policy
+            self.model = self.network.build(build_config)
+            self.model.to(self.ppo_device)
+            self.states = None
+            self.init_rnn_from_model(self.model)
+            self.last_lr = float(self.last_lr)
+            self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
+            self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
 
         if self.has_central_value:
+            central_value_state_shape = self.state_shape
+            if self.residual:
+                central_value_state_shape = (self.residual_obs_shape,)
             cv_config = {
-                'state_shape' : self.state_shape, 
+                'state_shape' : central_value_state_shape, 
                 'value_size' : self.value_size,
                 'ppo_device' : self.ppo_device, 
                 'num_agents' : self.num_agents, 

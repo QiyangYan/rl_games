@@ -409,7 +409,7 @@ class A2CBase(BaseAlgorithm):
             else:
                 res_dict = self.model(input_dict)
             if self.has_central_value:
-                states = obs['states']
+                states = obs['states'][:, self.base_policy_obs_shape:] if self.residual else obs['states']
                 input_dict = {
                     'is_train': False,
                     'states' : states,
@@ -439,16 +439,22 @@ class A2CBase(BaseAlgorithm):
                 base_input_dict['obs'] = base_input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
                 assert base_input_dict['obs'].shape[-1] == self.base_policy_obs_shape, f"Expected {self.base_policy_obs_shape}, but got {base_input_dict['obs'].shape[-1]}"
                 res_dict_base = self.model_base(base_input_dict)
-                base_action = res_dict_base['actions']
+                base_action = res_dict_base['mus'] # mus means deterministic action
+
+                cprint(f"sigmas mean: {res_dict_base['sigmas'].mean()}", "light_cyan")
 
                 # residual action
                 residual_input_dict = copy.deepcopy(input_dict)
-                residual_input_dict['obs'][:, -self.action_dim:] = base_action
+                # add base_action as obs
+                # residual_input_dict['obs'][:, -self.action_dim:] = base_action.detach() # Chenzy: add detach
                 residual_input_dict['obs'] = residual_input_dict['obs'][:, self.base_policy_obs_shape:] # check obs size
                 assert residual_input_dict['obs'].shape[-1] == self.residual_obs_shape, f"Expected {self.residual_obs_shape}, but got {residual_input_dict['obs'].shape[-1]}"
 
                 res_dict = self.model(residual_input_dict)
-                residual_action = res_dict['actions']
+                residual_action = res_dict['actions'].clone()
+
+                cprint(f"residual_sigma mean: {res_dict['sigmas'].mean()}", "light_cyan")
+
 
                 # mask residual action, only consider hand action
                 if self.mask_action:
@@ -463,14 +469,16 @@ class A2CBase(BaseAlgorithm):
                     residual_weighting =self.residual_weighting
 
                 # combine base and residual action
-                composed_action = base_action + residual_action * residual_weighting
+                composed_action = base_action.clone() # Chenzy: add clone
+                composed_action[:, self.residual_action_start_index:] += residual_action * residual_weighting 
+                # composed_action = base_action[:, self.residual_action_start_index] + residual_action * residual_weighting
                 cprint(f"self.residual_weighting: {self.residual_weighting}", "red")
 
             else:
                 res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
 
             if self.has_central_value:
-                states = obs['states']
+                states = obs['states'][:, self.base_policy_obs_shape:] if self.residual else obs['states']
                 input_dict = {
                     'is_train': False,
                     'states' : states,
@@ -486,7 +494,7 @@ class A2CBase(BaseAlgorithm):
     def get_values(self, obs):
         with torch.no_grad():
             if self.has_central_value:
-                states = obs['states']
+                states = obs['states'][:, self.base_policy_obs_shape:] if self.residual else obs['states']
                 self.central_value_net.eval()
                 input_dict = {
                     'is_train': False,
@@ -523,6 +531,9 @@ class A2CBase(BaseAlgorithm):
             'has_central_value' : self.has_central_value,
             'use_action_masks' : self.use_action_masks
         }
+        if self.residual:
+            self.env_info['action_space'] = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.residual_actions_dim,), dtype=np.float32)
+            self.env_info['state_space'] = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.residual_obs_shape,), dtype=np.float32)
         self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
@@ -777,10 +788,15 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
 
+            # from ipdb import set_trace; set_trace() # to check update_list data dict
+
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k]) 
             if self.has_central_value:
-                self.experience_buffer.update_data('states', n, self.obs['states'])
+                if self.residual:
+                    self.experience_buffer.update_data('states', n, self.obs['states'][:, self.base_policy_obs_shape:]) # chenzy: clip states if residual
+                else:
+                    self.experience_buffer.update_data('states', n, self.obs['states']) 
 
 
             step_time_start = time.time()
@@ -1043,7 +1059,7 @@ class DiscreteA2CBase(A2CBase):
             dataset_dict['returns'] = returns
             dataset_dict['actions'] = actions
             dataset_dict['dones'] = dones
-            dataset_dict['obs'] = batch_dict['states'] 
+            dataset_dict['obs'] = batch_dict['states'][:, :self.base_policy_state_shape] if self.residual else batch_dict['states']
             dataset_dict['rnn_masks'] = rnn_masks
             self.central_value_net.update_dataset(dataset_dict)
 
@@ -1162,6 +1178,8 @@ class ContinuousA2CBase(A2CBase):
         self.bc_batch_size = self.config.get('bc_batch_size', None)
 
         self.residual = self.config.get('use_residual', False)
+        self.residual_actions_dim = self.config.get('residual_actions_dim', None)
+        self.residual_action_start_index = self.config.get('residual_action_start_index', None)
         self.test_residual_base_policy = self.config.get('test_residual_base_policy', False)
         self.residual_weighting = self.config.get('residual_weighting', None)
         self.enable_warmup = self.config.get('enable_warmup', None)

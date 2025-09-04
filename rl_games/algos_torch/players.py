@@ -32,6 +32,10 @@ class PpoPlayerContinuous(BasePlayer):
         self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
         self.mask_action = self.config.get('mask_action', None)
         self.action_dim = self.config.get('action_dim', None)
+        self.residual_action_dim = self.config.get('residual_actions_dim', None)
+        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', None)
+        self.residual_obs_shape = self.config.get('residual_obs_shape', None)
+        self.residual_action_start_index = self.config.get('residual_action_start_index', None)
 
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
@@ -51,20 +55,46 @@ class PpoPlayerContinuous(BasePlayer):
             'normalize_value': self.normalize_value,
             'normalize_input': self.normalize_input,
         } 
-        self.model = self.network.build(config)
-        self.model.to(self.device)
-        self.model.eval()
-        self.is_rnn = self.model.is_rnn()
+        # self.model = self.network.build(config)
+        # self.model.to(self.device)
+        # self.model.eval()
+        # self.is_rnn = self.model.is_rnn()
 
+        # if self.residual:
+        #     build_config_base = config.copy()
+        #     build_config_base['input_shape'] = (self.base_policy_obs_shape, )
+        #     assert build_config_base['input_shape']==(self.base_policy_obs_shape, ), f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
+        #     self.model_base = self.network.build(build_config_base)
+        #     self.model_base.to(self.device)
+        #     self.model_base.eval()
+        #     self.is_rnn_residual = self.model_base.is_rnn()
+        
         if self.residual:
+            # for residual policy
+            config['actions_num'] = self.residual_action_dim
+            self.model = self.network.build(config)
+            self.model.to(self.device)
+            self.model.eval()
+            self.is_rnn = self.model.is_rnn()
+
+            # for base policy
             build_config_base = config.copy()
             build_config_base['input_shape'] = (self.base_policy_obs_shape, )
-            assert build_config_base['input_shape']==(self.base_policy_obs_shape, ), f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
+            build_config_base['actions_num'] = self.actions_num
+            # assert build_config_base['input_shape']==self.base_policy_obs_shape, f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
+            # build_config_base['actions_num'] = int(self.actions_num / 2)
             self.model_base = self.network.build(build_config_base)
             self.model_base.to(self.device)
             self.model_base.eval()
             self.is_rnn_residual = self.model_base.is_rnn()
-        
+
+        else:
+            # for one policy
+            self.model = self.network.build(config)
+            self.model.to(self.device)
+            self.model.eval()
+            self.is_rnn = self.model.is_rnn()
+
     def get_action(self, obs, is_determenistic = False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
@@ -91,35 +121,29 @@ class PpoPlayerContinuous(BasePlayer):
                     current_action_base = torch.squeeze(current_action.detach())
 
                 # resiudal action
-                input_dict['obs'][:, -self.action_dim:] = base_action # replace the base action placeholder with the actual base action
-                res_dict = self.model(input_dict)
+                # input_dict['obs'][:, -self.action_dim:] = base_action # replace the base action placeholder with the actual base action
+                residual_input_dict = copy.deepcopy(input_dict)
+                residual_input_dict['obs'] = residual_input_dict['obs'][:, self.base_policy_obs_shape:] # check obs size
+
+                res_dict = self.model(residual_input_dict)
+                residual_action = res_dict['actions'].clone()
+
+                current_action = base_action.clone()
+                current_action[:, self.residual_action_start_index:] += residual_action * 1.0
             else:
                 res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
 
-
-        mu = res_dict['mus']
-        action = res_dict['actions']
-        self.states = res_dict['rnn_states']
-        if is_determenistic:
-            current_action = mu
-        else:
-            current_action = action
-        if self.has_batch_dimension == False:
-            current_action = torch.squeeze(current_action.detach())
-
-        if self.residual:
-            # mask residual action, only consider hand action
-            if self.mask_action:
-                assert current_action.shape[-1] == self.action_dim
-                current_action[:self.mask_action] = 0.0
-
-            # combine base and residual action
-            composed_action = current_action_base + current_action * self.residual_weighting
-            current_action = composed_action
-            cprint(f"self.residual_weighting: {self.residual_weighting}", "red")
+                mu = res_dict['mus']
+                action = res_dict['actions']
+                self.states = res_dict['rnn_states']
+                if is_determenistic:
+                    current_action = mu
+                else:
+                    current_action = action
+                if self.has_batch_dimension == False:
+                    current_action = torch.squeeze(current_action.detach())
 
         # import ipdb; ipdb.set_trace()
-
         if self.clip_actions:
             return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
         else:
