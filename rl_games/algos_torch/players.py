@@ -30,12 +30,13 @@ class PpoPlayerContinuous(BasePlayer):
         self.num_warmup_steps = self.config.get('num_warmup_steps', 1000)
         self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
         self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
-        self.mask_action = self.config.get('mask_action', None)
         self.action_dim = self.config.get('action_dim', None)
         self.residual_action_dim = self.config.get('residual_actions_dim', None)
         self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', None)
         self.residual_obs_shape = self.config.get('residual_obs_shape', None)
         self.residual_action_start_index = self.config.get('residual_action_start_index', None)
+
+        self.gen_task_mode = self.config.get('gen_task_mode', False)
 
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
@@ -129,7 +130,16 @@ class PpoPlayerContinuous(BasePlayer):
                 residual_action = res_dict['actions'].clone()
 
                 current_action = base_action.clone()
-                current_action[:, self.residual_action_start_index:] += residual_action * 1.0
+                if self.gen_task_mode:
+                    # residual is task policy: hand + arm
+                    # base is generliast policy: hand
+                    hand_action = residual_action[:, :self.residual_action_start_index]
+                    arm_action = residual_action[:, self.residual_action_start_index:]
+                    current_action += hand_action * self.residual_weighting # generalist + residual hand
+                    import ipdb; ipdb.set_trace()
+                    current_action = np.concatenate([current_action, arm_action]) # hand + arm
+                else:
+                    current_action[:, self.residual_action_start_index:] += residual_action * self.residual_weighting
             else:
                 res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
 

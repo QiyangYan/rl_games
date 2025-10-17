@@ -455,12 +455,6 @@ class A2CBase(BaseAlgorithm):
 
                 cprint(f"residual_sigma mean: {res_dict['sigmas'].mean()}", "light_cyan")
 
-
-                # mask residual action, only consider hand action
-                if self.mask_action:
-                    assert residual_action.shape[-1] == self.action_dim
-                    residual_action[:self.mask_action] = 0.0
-
                 # add action wrapper
                 if self.enable_residual_distance:
                     if residual_input_dict['obs'][:, 12] > self.enable_residual_distance_threshold:
@@ -470,7 +464,16 @@ class A2CBase(BaseAlgorithm):
 
                 # combine base and residual action
                 composed_action = base_action.clone() # Chenzy: add clone
-                composed_action[:, self.residual_action_start_index:] += residual_action * residual_weighting 
+                if self.gen_task_mode:
+                    # residual is task policy: hand + arm
+                    # base is generliast policy: hand
+                    hand_action = residual_action[:, :self.residual_action_start_index]
+                    arm_action = residual_action[:, self.residual_action_start_index:]
+                    composed_action += hand_action * residual_weighting # generalist + residual hand
+                    import ipdb; ipdb.set_trace()
+                    composed_action = np.concatenate([composed_action, arm_action]) # hand + arm
+                else:
+                    composed_action[:, self.residual_action_start_index:] += residual_action * residual_weighting # add residual action to specified part (hand or arm)
                 # composed_action = base_action[:, self.residual_action_start_index] + residual_action * residual_weighting
                 cprint(f"self.residual_weighting: {self.residual_weighting}", "red")
 
@@ -1188,10 +1191,11 @@ class ContinuousA2CBase(A2CBase):
         self.env_obs_type = self.config.get('env_obs_type', None)
         self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', None)
         self.residual_obs_shape = self.config.get('residual_obs_shape', None)
-        self.mask_action = self.config.get('mask_action', None)
         self.action_dim = self.config.get('action_dim', None)
         self.enable_residual_distance_threshold = self.config.get('enable_residual_distance_threshold', None)
         self.enable_residual_distance = self.config.get('enable_residual_distance', False)
+
+        self.gen_task_mode = self.config.get('gen_task_mode', False)
 
         self.clip_actions = self.config.get('clip_actions', True)
 
