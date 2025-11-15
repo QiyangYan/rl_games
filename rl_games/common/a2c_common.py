@@ -303,7 +303,7 @@ class A2CBase(BaseAlgorithm):
             
             # Track when we last synced to S3
             self.last_summary_sync_epoch = 0
-            self.summary_sync_freq = self.config.get('summary_sync_freq', 1)  # Sync every N epochs
+            self.summary_sync_freq = self.config.get('summary_sync_freq', 100)  # Sync every N epochs
 
 
         self.entropy_coef = self.config['entropy_coef']
