@@ -12,6 +12,7 @@ from rl_games.common.interval_summary_writer import IntervalSummaryWriter
 from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
 from rl_games.algos_torch import  model_builder
 from rl_games.interfaces.base_algorithm import  BaseAlgorithm
+from rl_games.common import s3_utils
 import numpy as np
 import time
 import gym
@@ -256,16 +257,54 @@ class A2CBase(BaseAlgorithm):
         self.train_dir = config.get('train_dir', 'runs')
 
         # a folder inside of train_dir containing everything related to a particular experiment
-        self.experiment_dir = os.path.join(self.train_dir, self.experiment_name)
+        # Use S3-aware path joining to handle s3:// paths correctly
+        self.experiment_dir = s3_utils.s3_path_join(self.train_dir, self.experiment_name)
 
         # folders inside <train_dir>/<experiment_dir> for a specific purpose
-        self.nn_dir = os.path.join(self.experiment_dir, 'nn')
-        self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
+        self.nn_dir = s3_utils.s3_path_join(self.experiment_dir, 'nn')
+        self.summaries_dir = s3_utils.s3_path_join(self.experiment_dir, 'summaries')
 
-        os.makedirs(self.train_dir, exist_ok=True)
-        os.makedirs(self.experiment_dir, exist_ok=True)
-        os.makedirs(self.nn_dir, exist_ok=True)
-        os.makedirs(self.summaries_dir, exist_ok=True)
+        # Only create local directories if not using S3
+        if not s3_utils.is_s3_path(self.train_dir):
+            os.makedirs(self.train_dir, exist_ok=True)
+            os.makedirs(self.experiment_dir, exist_ok=True)
+            os.makedirs(self.nn_dir, exist_ok=True)
+            os.makedirs(self.summaries_dir, exist_ok=True)
+        else:
+            # Using S3 - S3 has no concept of directories, they're created automatically with first file
+            print(f"[RL_GAMES] Using S3 for storage:")
+            print(f"[RL_GAMES]   Checkpoints: {self.nn_dir}")
+            print(f"[RL_GAMES]   Summaries: {self.summaries_dir}")
+            print(f"[RL_GAMES]   Training Config: {self.experiment_dir}")
+            print(f"[RL_GAMES]   Note: S3 doesn't require directory creation, paths are virtual")
+            
+            # Verify S3 access early to catch configuration issues
+            print(f"[RL_GAMES] Verifying S3 write access...")
+            if not s3_utils.verify_s3_access(self.train_dir, experiment_name=self.experiment_name):
+                raise RuntimeError(
+                    f"Failed to verify S3 write access to {self.train_dir}. "
+                    "Check your AWS credentials and permissions."
+                )
+            
+            # Flag to save initial model after initialization completes
+            self.save_initial_model = True
+            
+            # TensorBoard SummaryWriter cannot write directly to S3
+            # We use a local directory temporarily and sync to S3 periodically
+            self.local_summaries_dir = os.path.join('runs', self.experiment_name, 'summaries')
+            os.makedirs(self.local_summaries_dir, exist_ok=True)
+            print(f"[RL_GAMES]   Local temp dir for summaries: {self.local_summaries_dir}")
+            print(f"[RL_GAMES]   (Will sync to S3 periodically)")
+            
+            # Store the S3 summaries path for syncing
+            self.s3_summaries_dir = self.summaries_dir
+            # Use local directory for SummaryWriter
+            self.summaries_dir = self.local_summaries_dir
+            
+            # Track when we last synced to S3
+            self.last_summary_sync_epoch = 0
+            self.summary_sync_freq = self.config.get('summary_sync_freq', 1)  # Sync every N epochs
+
 
         self.entropy_coef = self.config['entropy_coef']
 
@@ -275,6 +314,10 @@ class A2CBase(BaseAlgorithm):
                 self.writer = IntervalSummaryWriter(writer, self.config)
             else:
                 self.writer = writer
+            
+            # Initial sync of summaries to S3 (creates empty directory structure)
+            if hasattr(self, 's3_summaries_dir'):
+                self.sync_summaries_to_s3()
         else:
             self.writer = None
 
@@ -362,6 +405,16 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
+
+    def sync_summaries_to_s3(self):
+        """Sync TensorBoard summaries from local directory to S3."""
+        if hasattr(self, 's3_summaries_dir') and hasattr(self, 'local_summaries_dir'):
+            # Flush writer to ensure all data is written
+            if self.writer is not None:
+                self.writer.flush()
+            
+            # Sync to S3
+            s3_utils.sync_directory_to_s3(self.local_summaries_dir, self.s3_summaries_dir, delete_after_sync=False)
 
     def set_eval(self):
         if self.residual:
@@ -1133,18 +1186,22 @@ class DiscreteA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards <= self.last_mean_rewards):
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                        if (epoch_num % self.save_freq == 0):
+                            self.save(s3_utils.s3_path_join(self.nn_dir, 'last_' + checkpoint_name))
+                    
+                    # Sync summaries to S3 periodically
+                    if hasattr(self, 'summary_sync_freq') and (epoch_num % self.summary_sync_freq == 0):
+                        self.sync_summaries_to_s3()
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
                         self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config['name']))
+                        self.save(s3_utils.s3_path_join(self.nn_dir, self.config['name']))
 
                         if 'score_to_win' in self.config:
                             if self.last_mean_rewards > self.config['score_to_win']:
                                 print('Network won!')
-                                self.save(os.path.join(self.nn_dir, checkpoint_name))
+                                self.save(s3_utils.s3_path_join(self.nn_dir, checkpoint_name))
                                 should_exit = True
 
                 if epoch_num >= self.max_epochs:
@@ -1152,9 +1209,12 @@ class DiscreteA2CBase(A2CBase):
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(os.path.join(self.nn_dir,
+                    self.save(s3_utils.s3_path_join(self.nn_dir,
                                                'last_' + self.config['name'] + 'ep' + str(epoch_num) + 'rew' + str(
                                                    mean_rewards)))
+                    # Final sync of summaries to S3
+                    if hasattr(self, 's3_summaries_dir'):
+                        self.sync_summaries_to_s3()
                     print('MAX EPOCHS NUM!')
                     should_exit = True
                 update_time = 0
@@ -1477,25 +1537,32 @@ class ContinuousA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards[0] <= self.last_mean_rewards):
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                        if (epoch_num % self.save_freq == 0):
+                            self.save(s3_utils.s3_path_join(self.nn_dir, 'last_' + checkpoint_name))
+                    
+                    # Sync summaries to S3 periodically
+                    if hasattr(self, 'summary_sync_freq') and (epoch_num % self.summary_sync_freq == 0):
+                        self.sync_summaries_to_s3()
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
                         self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config['name']))
+                        self.save(s3_utils.s3_path_join(self.nn_dir, self.config['name']))
 
                         if 'score_to_win' in self.config:
                             if self.last_mean_rewards > self.config['score_to_win']:
                                 print('Network won!')
-                                self.save(os.path.join(self.nn_dir, checkpoint_name))
+                                self.save(s3_utils.s3_path_join(self.nn_dir, checkpoint_name))
                                 should_exit = True
 
                 if epoch_num >= self.max_epochs:
                     if self.game_rewards.current_size == 0:
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + 'ep' + str(epoch_num) + 'rew' + str(mean_rewards)))
+                    self.save(s3_utils.s3_path_join(self.nn_dir, 'last_' + self.config['name'] + 'ep' + str(epoch_num) + 'rew' + str(mean_rewards)))
+                    # Final sync of summaries to S3
+                    if hasattr(self, 's3_summaries_dir'):
+                        self.sync_summaries_to_s3()
                     print('MAX EPOCHS NUM!')
                     should_exit = True
 

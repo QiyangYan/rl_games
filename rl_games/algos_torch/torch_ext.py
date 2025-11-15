@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.optim.optimizer import Optimizer
 import math
 import time
+from rl_games.common import s3_utils
 
 numpy_to_torch_dtype_dict = {
     np.dtype('bool')       : torch.bool,
@@ -75,12 +76,20 @@ def safe_load(filename):
     return safe_filesystem_op(torch.load, filename)
 
 def save_checkpoint(filename, state):
-    print("=> saving checkpoint '{}'".format(filename + '.pth'))
-    safe_save(state, filename + '.pth')
+    # Check if this is an S3 path
+    if s3_utils.is_s3_path(filename):
+        s3_utils.save_checkpoint_to_s3(state, filename)
+    else:
+        print("=> saving checkpoint '{}'".format(filename + '.pth'))
+        safe_save(state, filename + '.pth')
 
 def load_checkpoint(filename):
-    print("=> loading checkpoint '{}'".format(filename))
-    state = safe_load(filename)
+    # Check if this is an S3 path
+    if s3_utils.is_s3_path(filename):
+        state = s3_utils.load_checkpoint_from_s3(filename)
+    else:
+        print("=> loading checkpoint '{}'".format(filename))
+        state = safe_load(filename)
     return state
 
 def parameterized_truncated_normal(uniform, mu, sigma, a, b):

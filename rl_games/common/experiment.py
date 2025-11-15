@@ -1,5 +1,8 @@
 import copy
 import yaml
+import os
+import tempfile
+from rl_games.common import s3_utils
 
 class Experiment:
     def __init__(self, config, experiment_config):
@@ -16,6 +19,17 @@ class Experiment:
 
         self.done = False
         self.results = {}
+        
+        # Determine output path for experiment configs
+        train_dir = self.config.get('params', {}).get('config', {}).get('train_dir', 'runs')
+        if s3_utils.is_s3_path(train_dir):
+            # If using S3, store configs in S3
+            self.config_output_path = s3_utils.s3_path_join(train_dir, 'data.yml')
+            print(f"[EXPERIMENT] Config will be saved to S3: {self.config_output_path}")
+        else:
+            # Local path
+            self.config_output_path = 'data.yml'
+        
         self.create_config()
 
     def _set_parameter(self, config, path, value):
@@ -41,8 +55,26 @@ class Experiment:
         for key in self.experiments[self.last_exp_idx]['exp']:
             self._set_parameter(self.current_config, key['path'], key['value'][self.sub_idx])
 
-        with open('data.yml', 'w') as outfile:
-            yaml.dump(self.current_config, outfile, default_flow_style=False)
+        # Write config to S3 or local file
+        if s3_utils.is_s3_path(self.config_output_path):
+            # Write to S3
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tmp_file:
+                yaml.dump(self.current_config, tmp_file, default_flow_style=False)
+                tmp_path = tmp_file.name
+            
+            try:
+                import boto3
+                bucket, key = s3_utils.parse_s3_path(self.config_output_path)
+                s3_client = boto3.client('s3')
+                s3_client.upload_file(tmp_path, bucket, key)
+                print(f"[EXPERIMENT] Config saved to S3: {self.config_output_path}")
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+        else:
+            # Write to local file
+            with open(self.config_output_path, 'w') as outfile:
+                yaml.dump(self.current_config, outfile, default_flow_style=False)
 
     def get_next_config(self):
         config = self.current_config

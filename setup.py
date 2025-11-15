@@ -43,7 +43,8 @@ setup(name='rl-games',
             'tensorboardX>=1.6',
             'setproctitle',
             'psutil',
-            'pyyaml'
+            'pyyaml',
+            'boto3'  # For S3 checkpoint saving
             # Optional dependencies
             # 'ray>=1.1.0',
       ],

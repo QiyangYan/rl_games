@@ -1,5 +1,6 @@
 from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
+from rl_games.common import s3_utils
 
 from rl_games.algos_torch import central_value
 from rl_games.common import common_losses
@@ -99,12 +100,20 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.has_value_loss = (self.has_central_value and self.use_experimental_cv) \
                             or (not self.has_phasic_policy_gradients and not self.has_central_value) 
         self.algo_observer.after_init(self)
+        
+        # Save initial model to S3 if requested
+        if hasattr(self, 'save_initial_model') and self.save_initial_model:
+            print(f"[RL_GAMES] Saving initial model to S3...")
+            initial_checkpoint_path = s3_utils.s3_path_join(self.nn_dir, 'initial_model')
+            self.save(initial_checkpoint_path)
+            self.save_initial_model = False  # Only save once
 
     def update_epoch(self):
         self.epoch_num += 1
         return self.epoch_num
         
     def save(self, fn):
+        print(f"[DEBUG] Saving checkpoint to: {fn}")
         state = self.get_full_state_weights()
         torch_ext.save_checkpoint(fn, state)
 
