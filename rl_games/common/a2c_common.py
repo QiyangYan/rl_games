@@ -1540,9 +1540,9 @@ class ContinuousA2CBase(A2CBase):
                         if (epoch_num % self.save_freq == 0):
                             self.save(s3_utils.s3_path_join(self.nn_dir, 'last_' + checkpoint_name))
                     
-                        # Sync summaries to S3 periodically
-                        if hasattr(self, 'summary_sync_freq') and (epoch_num % self.save_freq == 0):
-                            self.sync_summaries_to_s3()
+                    # Sync summaries to S3 periodically
+                    if hasattr(self, 'summary_sync_freq') and (epoch_num % self.summary_sync_freq == 0):
+                        self.sync_summaries_to_s3()
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
