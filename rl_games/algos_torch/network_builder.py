@@ -204,7 +204,20 @@ class A2CBuilder(NetworkBuilder):
                 if self.separate:
                     self.critic_cnn = self._build_conv( **cnn_args)
 
-            mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
+            if self.has_pc_encoder:
+                from rl_games.algos_torch.pretrain_pointnets import PointNet32
+                self.actor_cnn = PointNet32()
+
+                if self.separate:
+                    self.critic_cnn = PointNet32()
+            
+            if self.has_pc_encoder:
+                dummy = torch.randn(1, self.pc_input_dim, 3)
+                encoder_output_shape = self.actor_cnn(dummy)
+                assert(len(input_shape) == 1)
+                mlp_input_shape = input_shape[0] + encoder_output_shape.shape[1] - self.pc_input_dim * 3
+            else:
+                mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
 
             in_mlp_shape = mlp_input_shape
             if len(self.units) == 0:
@@ -303,6 +316,8 @@ class A2CBuilder(NetworkBuilder):
                     obs = obs.permute((0, 3, 1, 2))
 
             if self.separate:
+                if self.has_pc_encoder:
+                    raise NotImplementedError('Separate cnn not implemented for pc encoder yet')
                 a_out = c_out = obs
                 a_out = self.actor_cnn(a_out)
                 a_out = a_out.contiguous().view(a_out.size(0), -1)
@@ -380,7 +395,13 @@ class A2CBuilder(NetworkBuilder):
                     return mu, sigma, value, states
             else:
                 out = obs
-                out = self.actor_cnn(out)
+                if self.has_pc_encoder:
+                    pc_in = out[:, -self.pc_input_dim*3:].reshape(out.size(0), self.pc_input_dim, 3)
+                    obs_out = out[:, :-self.pc_input_dim*3]
+                    pc_out = self.actor_cnn(pc_in)
+                    out = torch.cat([obs_out, pc_out], dim=1)
+                else:
+                    out = self.actor_cnn(out)
                 out = out.flatten(1)                
 
                 if self.has_rnn:
@@ -507,6 +528,12 @@ class A2CBuilder(NetworkBuilder):
                 self.permute_input = self.cnn.get('permute_input', True)
             else:
                 self.has_cnn = False
+
+            if 'pc_encoder' in params:
+                self.has_pc_encoder = True
+                self.pc_input_dim = params['pc_encoder']['pc_input_dim']
+            else:                
+                self.has_pc_encoder = False
 
     def build(self, name, **kwargs):
         net = A2CBuilder.Network(self.params, **kwargs)
