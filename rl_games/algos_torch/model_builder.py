@@ -18,7 +18,6 @@ class NetworkBuilder:
         self.network_factory = object_factory.ObjectFactory()
         self.network_factory.set_builders(NETWORK_REGISTRY)
         self.network_factory.register_builder('actor_critic', lambda **kwargs: network_builder.A2CBuilder())
-        # self.network_factory.register_builder('actor_critic_diffusion', lambda **kwargs: network_builder.A2C_Diffusion_Builder())
         self.network_factory.register_builder('resnet_actor_critic',
                                               lambda **kwargs: network_builder.A2CResnetBuilder())
         self.network_factory.register_builder('rnd_curiosity', lambda **kwargs: network_builder.RNDCuriosityBuilder())
@@ -43,6 +42,8 @@ class ModelBuilder:
                                             lambda network, **kwargs: models.ModelA2CContinuous(network))
         self.model_factory.register_builder('continuous_a2c_logstd',
                                             lambda network, **kwargs: models.ModelA2CContinuousLogStd(network))
+        self.model_factory.register_builder('multi_continuous_a2c_logstd',
+                                            lambda network, **kwargs: models.ModelMultiA2CContinuousLogStd(network))
         self.model_factory.register_builder('soft_actor_critic',
                                             lambda network, **kwargs: models.ModelSACContinuous(network))
         self.model_factory.register_builder('central_value',

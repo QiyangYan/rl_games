@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,8 +6,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.optimizer import Optimizer
 import math
+import torch.distributed as dist
 import time
-from rl_games.common import s3_utils
 
 numpy_to_torch_dtype_dict = {
     np.dtype('bool')       : torch.bool,
@@ -69,31 +70,34 @@ def safe_filesystem_op(func, *args, **kwargs):
 
     raise RuntimeError(f'Could not execute {func}, give up after {num_attempts} attempts...')
 
+def safe_symlink(src, dst):
+    try:
+        safe_filesystem_op(os.remove, dst)
+    except (FileExistsError, RuntimeError):
+        pass
+    safe_filesystem_op(os.symlink, src, dst)
+
 def safe_save(state, filename):
     return safe_filesystem_op(torch.save, state, filename)
 
 def safe_load(filename):
-    return safe_filesystem_op(torch.load, filename)
+    return safe_filesystem_op(torch.load, filename, weights_only=False)
 
 def save_checkpoint(filename, state):
-    # Check if this is an S3 path
-    if s3_utils.is_s3_path(filename):
-        s3_utils.save_checkpoint_to_s3(state, filename)
-    else:
-        print("=> saving checkpoint '{}'".format(filename + '.pth'))
-        safe_save(state, filename + '.pth')
+    print("=> saving checkpoint '{}'".format(filename + '.pth'))
+    safe_save(state, filename + '.pth')
 
 def load_checkpoint(filename):
-    # Check if this is an S3 path
-    if s3_utils.is_s3_path(filename):
-        state = s3_utils.load_checkpoint_from_s3(filename)
-    else:
-        print("=> loading checkpoint '{}'".format(filename))
+    print("=> loading checkpoint '{}'".format(filename))
+    try:
         state = safe_load(filename)
+    except:
+        print("=> failed to load checkpoint '{}'. Trying from {}.old".format(filename, filename))
+        state = safe_load(filename + '.old')
     return state
 
 def parameterized_truncated_normal(uniform, mu, sigma, a, b):
-    normal = torch.distributions.normal.Normal(0, 1)
+    normal = torch.distributions.normal.Normal(0, 1, validate_args=False)
 
     alpha = (a - mu) / sigma
     beta = (b - mu) / sigma
@@ -148,11 +152,33 @@ def apply_masks(losses, mask=None):
     
     return res_losses, sum_mask
 
+def dist_mean_var_count(mean: torch.Tensor, var: torch.Tensor, count: int):
+    square_sum = var * (count - 1) + (mean ** 2) * count
+    sum = mean * count
+    count = torch.tensor(count, dtype=torch.float64).to(mean.device)
+    dist.all_reduce(square_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    count = int(count.item())
+    mean = sum / count
+    var = (square_sum - (mean ** 2) * count) / (count - 1)
+    return mean, var, count
+
 def normalization_with_masks(values, masks):
     if masks is None:
-        return (values - values.mean()) / (values.std() + 1e-8)
-
-    values_mean, values_var = get_mean_var_with_masks(values, masks)
+        if os.getenv("LOCAL_RANK") and os.getenv("WORLD_SIZE"): # multi-gpu
+            mean, var, _ = dist_mean_var_count(values.mean(), values.var(), len(values))
+            std = torch.sqrt(var)
+        else:
+            mean = values.mean()
+            std = values.std()
+        return (values - mean) / (std + 1e-8)
+    
+    if os.getenv("LOCAL_RANK") and os.getenv("WORLD_SIZE"):
+        mean, var = get_mean_var_with_masks(values, masks)
+        values_mean, values_var, _ = dist_mean_var_count(mean, var, masks.sum())
+    else:
+        values_mean, values_var = get_mean_var_with_masks(values, masks)
     values_std = torch.sqrt(values_var)
     normalized_values = (values - values_mean) / (values_std + 1e-8)
 
@@ -287,74 +313,33 @@ def get_mean(v):
     return mean
 
 
-class CategoricalMaskedNaive(torch.distributions.Categorical):
-    def __init__(self, probs=None, logits=None, validate_args=None, masks=None):
-        self.masks = masks
-        if self.masks is None:
-            super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-        else:
-            inf_mask = torch.log(masks.float())
-            logits = logits + inf_mask
-            super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-    
-    def entropy(self):
-        if self.masks is None:
-            return super(CategoricalMasked, self).entropy()
-        p_log_p = self.logits * self.probs
-        p_log_p[p_log_p != p_log_p] = 0
-        return -p_log_p.sum(-1)
-
-
-class CategoricalMasked(torch.distributions.Categorical):
-    def __init__(self, probs=None, logits=None, validate_args=None, masks=None):
-        self.masks = masks
-        if masks is None:
-            super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-        else:
-            self.device = self.masks.device
-            logits = torch.where(self.masks, logits, torch.tensor(-1e+8).to(self.device))
-            super(CategoricalMasked, self).__init__(probs, logits, validate_args)
-    
-    def rsample(self):
-        u = torch.distributions.Uniform(low=torch.zeros_like(self.logits, device = self.logits.device), high=torch.ones_like(self.logits, device = self.logits.device)).sample()
-        #print(u.size(), self.logits.size())
-        rand_logits = self.logits -(-u.log()).log()
-        return torch.max(rand_logits, axis=-1)[1]
-
-    def entropy(self):
-        if self.masks is None:
-            return super(CategoricalMasked, self).entropy()
-        p_log_p = self.logits * self.probs
-        p_log_p = torch.where(self.masks, p_log_p, torch.tensor(0.0).to(self.device))
-        return -p_log_p.sum(-1)
-
 class AverageMeter(nn.Module):
     def __init__(self, in_shape, max_size):
         super(AverageMeter, self).__init__()
         self.max_size = max_size
-        self.current_size = 0
+        self.register_buffer("current_size", torch.tensor(0, dtype = torch.int32))
         self.register_buffer("mean", torch.zeros(in_shape, dtype = torch.float32))
 
     def update(self, values):
         size = values.size()[0]
         if size == 0:
             return
-        new_mean = torch.mean(values.float(), dim=0)
+        new_mean = torch.mean(values.float(), dim=0).reshape(self.mean.shape)
         size = np.clip(size, 0, self.max_size)
         old_size = min(self.max_size - size, self.current_size)
         size_sum = old_size + size
-        self.current_size = size_sum
+        self.current_size = torch.tensor(size_sum, dtype = torch.int32)
         self.mean = (self.mean * old_size + new_mean * size) / size_sum
 
     def clear(self):
-        self.current_size = 0
+        self.current_size = torch.tensor(0, dtype = torch.int32)
         self.mean.fill_(0)
 
     def __len__(self):
-        return self.current_size
+        return self.current_size.item()
 
     def get_mean(self):
-        return self.mean.squeeze(0).cpu().numpy()
+        return self.mean.cpu().numpy()
 
 
 class IdentityRNN(nn.Module):

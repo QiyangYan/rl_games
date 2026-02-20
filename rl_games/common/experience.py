@@ -287,7 +287,7 @@ class ExperienceBuffer:
     More generalized than replay buffers.
     Implemented for on-policy algos
     '''
-    def __init__(self, env_info, algo_info, device, aux_tensor_dict=None):
+    def __init__(self, env_info, algo_info, device, extra_obs_dim=None, aux_tensor_dict=None):
         self.env_info = env_info
         self.algo_info = algo_info
         self.device = device
@@ -318,27 +318,30 @@ class ExperienceBuffer:
             self.actions_num = self.action_space.shape[0]
             self.is_continuous = True
         self.tensor_dict = {}
-        self._init_from_env_info(self.env_info)
+        self._init_from_env_info(self.env_info, extra_obs_dim)
 
         self.aux_tensor_dict = aux_tensor_dict
         if self.aux_tensor_dict is not None:
             self._init_from_aux_dict(self.aux_tensor_dict)
 
-    def _init_from_env_info(self, env_info):
+    def _init_from_env_info(self, env_info, extra_obs_dim):
         obs_base_shape = self.obs_base_shape
         state_base_shape = self.state_base_shape
 
-        self.tensor_dict['obses'] = self._create_tensor_from_space(env_info['observation_space'], obs_base_shape)
+        self.tensor_dict['obses'] = self._create_tensor_from_space(env_info['observation_space'], obs_base_shape, extra_obs_dim)
         if self.has_central_value:
-            self.tensor_dict['states'] = self._create_tensor_from_space(env_info['state_space'], state_base_shape)
+            self.tensor_dict['states'] = self._create_tensor_from_space(env_info['state_space'], state_base_shape,extra_obs_dim)
         
         val_space = gym.spaces.Box(low=0, high=1,shape=(env_info.get('value_size',1),))
+        intr_rew_space = gym.spaces.Box(low=0, high=1,shape=(1,))
         self.tensor_dict['rewards'] = self._create_tensor_from_space(val_space, obs_base_shape)
+        self.tensor_dict['intr_rewards'] = self._create_tensor_from_space(intr_rew_space, obs_base_shape)
         self.tensor_dict['values'] = self._create_tensor_from_space(val_space, obs_base_shape)
         self.tensor_dict['neglogpacs'] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=(), dtype=np.float32), obs_base_shape)
         self.tensor_dict['dones'] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=(), dtype=np.uint8), obs_base_shape)
+
         if self.is_discrete or self.is_multi_discrete:
-            self.tensor_dict['actions'] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=self.actions_shape, dtype=np.long), obs_base_shape)
+            self.tensor_dict['actions'] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=self.actions_shape, dtype=int), obs_base_shape)
         if self.use_action_masks:
             self.tensor_dict['action_masks'] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=self.actions_shape + (np.sum(self.actions_num),), dtype=np.bool), obs_base_shape)
         if self.is_continuous:
@@ -351,10 +354,17 @@ class ExperienceBuffer:
         for k,v in tensor_dict.items():
             self.tensor_dict[k] = self._create_tensor_from_space(gym.spaces.Box(low=0, high=1,shape=(v), dtype=np.float32), obs_base_shape)
 
-    def _create_tensor_from_space(self, space, base_shape):       
+    def _create_tensor_from_space(self, space, base_shape, extra_dim=None):       
         if type(space) is gym.spaces.Box:
             dtype = numpy_to_torch_dtype_dict[space.dtype]
-            return torch.zeros(base_shape + space.shape, dtype= dtype, device = self.device)
+            
+            if extra_dim is not None:
+                assert len(space.shape) == 1
+                space_shape = (space.shape[0] + extra_dim,)
+            else:
+                space_shape = space.shape
+            
+            return torch.zeros(base_shape + space_shape, dtype= dtype, device = self.device)
         if type(space) is gym.spaces.Discrete:
             dtype = numpy_to_torch_dtype_dict[space.dtype]
             return torch.zeros(base_shape, dtype= dtype, device = self.device)

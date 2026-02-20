@@ -1,3 +1,4 @@
+from rl_games.common.custom_utils import create_sinusoidal_encoding
 from rl_games.common.player import BasePlayer
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
@@ -6,8 +7,7 @@ import gym
 import torch 
 from torch import nn
 import numpy as np
-from termcolor import cprint
-import copy
+import os
 
 
 def rescale_actions(low, high, action):
@@ -18,26 +18,9 @@ def rescale_actions(low, high, action):
 
 
 class PpoPlayerContinuous(BasePlayer):
+
     def __init__(self, params):
         BasePlayer.__init__(self, params)
-        self.residual = self.config.get('use_residual', False)
-        cprint(f'Using residual policy: {self.residual}', 'red')
-        self.more_info_for_residual = self.config.get('more_info_for_residual', False)
-
-        self.residual = self.config.get('use_residual', False)
-        self.residual_weighting = self.config.get('residual_weighting', None)
-        self.enable_warmup = self.config.get('enable_warmup', None)
-        self.num_warmup_steps = self.config.get('num_warmup_steps', 1000)
-        self.base_policy_checkpoint = self.config.get('base_policy_checkpoint', None)
-        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', 128)
-        self.action_dim = self.config.get('action_dim', None)
-        self.residual_action_dim = self.config.get('residual_actions_dim', None)
-        self.base_policy_obs_shape = self.config.get('base_policy_obs_shape', None)
-        self.residual_obs_shape = self.config.get('residual_obs_shape', None)
-        self.residual_action_start_index = self.config.get('residual_action_start_index', None)
-
-        self.gen_task_mode = self.config.get('gen_task_mode', False)
-
         self.network = self.config['network']
         self.actions_num = self.action_space.shape[0] 
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
@@ -47,134 +30,90 @@ class PpoPlayerContinuous(BasePlayer):
         self.normalize_input = self.config['normalize_input']
         self.normalize_value = self.config.get('normalize_value', False)
 
-        obs_shape = self.obs_shape
+        if self.intr_reward_coef_embd is not None and not (self.expl_type.startswith('mixed_expl') and 'disjoint' in self.expl_type):
+            input_shape = (self.obs_shape[0] + self.intr_reward_coef_embd.shape[1],)
+        else:
+            input_shape = self.obs_shape
+
         config = {
             'actions_num' : self.actions_num,
-            'input_shape' : obs_shape,
-            'num_seqs' : self.num_agents,
+            'input_shape' : input_shape,
+            'num_seqs' : self.env.num_envs * self.num_agents,
             'value_size': self.env_info.get('value_size',1),
             'normalize_value': self.normalize_value,
             'normalize_input': self.normalize_input,
+            'type' : 'simple' if 'learn_param' not in self.expl_type else 'extra_param', 
         } 
-        # self.model = self.network.build(config)
-        # self.model.to(self.device)
-        # self.model.eval()
-        # self.is_rnn = self.model.is_rnn()
-
-        # if self.residual:
-        #     build_config_base = config.copy()
-        #     build_config_base['input_shape'] = (self.base_policy_obs_shape, )
-        #     assert build_config_base['input_shape']==(self.base_policy_obs_shape, ), f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
-        #     self.model_base = self.network.build(build_config_base)
-        #     self.model_base.to(self.device)
-        #     self.model_base.eval()
-        #     self.is_rnn_residual = self.model_base.is_rnn()
         
-        if self.residual:
-            # for residual policy
-            config['actions_num'] = self.residual_action_dim
-            self.model = self.network.build(config)
-            self.model.to(self.device)
-            self.model.eval()
-            self.is_rnn = self.model.is_rnn()
+        if self.expl_type.startswith('mixed_expl'):
+            # TODO: remove the hardcoded value 6. Change it manually to number of blocks tilll then.
+            if 'disjoint' in self.expl_type or 'learn_param' in self.expl_type:
+                ids = torch.linspace(50.0, 0.0, 6).to(self.device_name).reshape(-1,1)
+            else:
+                ids = create_sinusoidal_encoding(torch.linspace(50.0, 0.0, 6), self.config.get('expl_reward_coef_embd_size', 32), n=100).to(self.device_name)
+            config['coef_ids'] = ids[::self.num_agents,0]
+            config['coef_id_idx'] = self.obs_shape[0]
+                    
+        self.model = self.network.build(config)
+        self.model.to(self.device)
+        self.model.eval()
+        self.is_rnn = self.model.is_rnn()
 
-            # for base policy
-            build_config_base = config.copy()
-            build_config_base['input_shape'] = (self.base_policy_obs_shape, )
-            build_config_base['actions_num'] = self.actions_num
-            # assert build_config_base['input_shape']==self.base_policy_obs_shape, f"Check base policy size, base_policy_obs_shape: {self.base_policy_obs_shape}, config: {build_config_base['input_shape']}"
-            # build_config_base['actions_num'] = int(self.actions_num / 2)
-            self.model_base = self.network.build(build_config_base)
-            self.model_base.to(self.device)
-            self.model_base.eval()
-            self.is_rnn_residual = self.model_base.is_rnn()
-
-        else:
-            # for one policy
-            self.model = self.network.build(config)
-            self.model.to(self.device)
-            self.model.eval()
-            self.is_rnn = self.model.is_rnn()
-
-    def get_action(self, obs, is_determenistic = False):
+    def get_action(self, obs, is_deterministic = False, use_default_rnn_states = False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
+        rnn_states = self.states
+        if use_default_rnn_states:
+            # This should almost always be False
+            # However, for debugging purposes, we can get deterministic behavior by setting is_deterministic=True and use_default_rnn_states=True
+            rnn_states = self.model.get_default_rnn_state()
+            rnn_states = [s.to(self.device) for s in rnn_states]
+
         input_dict = {
             'is_train': False,
             'prev_actions': None, 
             'obs' : obs,
-            'rnn_states' : self.states
+            'rnn_states' : rnn_states
         }
         with torch.no_grad():
-            if self.residual:
-                # base action
-                base_input_dict = copy.deepcopy(input_dict)
-                base_input_dict['obs'] = base_input_dict['obs'][:, :self.base_policy_obs_shape] # check obs size
-                res_dict_base = self.model_base(base_input_dict)
-                base_mu = res_dict_base['mus']
-                base_action = res_dict_base['actions']
-                if is_determenistic:
-                    current_action_base = base_mu
-                else:
-                    current_action_base = base_action
-                if self.has_batch_dimension == False:
-                    current_action_base = torch.squeeze(current_action.detach())
+            res_dict = self.model(input_dict)
+        mu = res_dict['mus']
+        action = res_dict['actions']
+        self.states = res_dict['rnn_states']
+        if is_deterministic:
+            current_action = mu
+        else:
+            current_action = action
+        if self.has_batch_dimension == False:
+            current_action = torch.squeeze(current_action.detach())
 
-                # resiudal action
-                # input_dict['obs'][:, -self.action_dim:] = base_action # replace the base action placeholder with the actual base action
-                residual_input_dict = copy.deepcopy(input_dict)
-                residual_input_dict['obs'] = residual_input_dict['obs'][:, self.base_policy_obs_shape:] # check obs size
-
-                res_dict = self.model(residual_input_dict)
-                residual_action = res_dict['actions'].clone()
-
-                current_action = base_action.clone()
-                if self.gen_task_mode:
-                    # residual is task policy: hand + arm
-                    # base is generliast policy: hand
-                    hand_action = residual_action[:, :self.residual_action_start_index]
-                    arm_action = residual_action[:, self.residual_action_start_index:]
-                    current_action += hand_action * self.residual_weighting # generalist + residual hand
-                    import ipdb; ipdb.set_trace()
-                    current_action = np.concatenate([current_action, arm_action]) # hand + arm
-                else:
-                    current_action[:, self.residual_action_start_index:] += residual_action * self.residual_weighting
-            else:
-                res_dict = self.model(input_dict) # dict_keys(['neglogpacs', 'values', 'actions', 'rnn_states', 'mus', 'sigmas'])
-
-                mu = res_dict['mus']
-                action = res_dict['actions']
-                self.states = res_dict['rnn_states']
-                if is_determenistic:
-                    current_action = mu
-                else:
-                    current_action = action
-                if self.has_batch_dimension == False:
-                    current_action = torch.squeeze(current_action.detach())
-
-        # import ipdb; ipdb.set_trace()
         if self.clip_actions:
             return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
         else:
             return current_action
 
     def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
-        self.model.load_state_dict(checkpoint['model'])
-        # from ipdb import set_trace; set_trace()
-        if self.normalize_input and 'running_mean_std' in checkpoint:
-            self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+        if os.path.exists(fn):
+            checkpoint = torch_ext.load_checkpoint(fn)
+            if 0 in checkpoint:
+                checkpoint = checkpoint[0]
+            self.model.load_state_dict(checkpoint['model'])
+            if self.normalize_input and 'running_mean_std' in checkpoint:
+                self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
-        if self.residual:
-            fn = self.base_policy_checkpoint 
-            checkpoint_base = torch_ext.load_checkpoint(fn)
-            self.model_base.load_state_dict(checkpoint_base['model'])
+            env_state = checkpoint.get('env_state', None)
+            if self.env is not None and env_state is not None:
+                self.env.set_env_state(env_state)
 
+        self.loaded_checkpoint = fn
+        
     def reset(self):
         self.init_rnn()
 
+
 class PpoPlayerDiscrete(BasePlayer):
+
     def __init__(self, params):
         BasePlayer.__init__(self, params)
 
@@ -203,7 +142,7 @@ class PpoPlayerDiscrete(BasePlayer):
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
-    def get_masked_action(self, obs, action_masks, is_determenistic = True):
+    def get_masked_action(self, obs, action_masks, is_deterministic = True):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
@@ -223,18 +162,18 @@ class PpoPlayerDiscrete(BasePlayer):
         action = res_dict['actions']
         self.states = res_dict['rnn_states']
         if self.is_multi_discrete:
-            if is_determenistic:
+            if is_deterministic:
                 action = [torch.argmax(logit.detach(), axis=-1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
             else:    
                 return action.squeeze().detach()
         else:
-            if is_determenistic:
+            if is_deterministic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
             else:    
                 return action.squeeze().detach()
 
-    def get_action(self, obs, is_determenistic = False):
+    def get_action(self, obs, is_deterministic = False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
@@ -252,13 +191,13 @@ class PpoPlayerDiscrete(BasePlayer):
         action = res_dict['actions']
         self.states = res_dict['rnn_states']
         if self.is_multi_discrete:
-            if is_determenistic:
+            if is_deterministic:
                 action = [torch.argmax(logit.detach(), axis=1).squeeze() for logit in logits]
                 return torch.stack(action,dim=-1)
             else:    
                 return action.squeeze().detach()
         else:
-            if is_determenistic:
+            if is_deterministic:
                 return torch.argmax(logits.detach(), axis=-1).squeeze()
             else:    
                 return action.squeeze().detach()
@@ -269,11 +208,16 @@ class PpoPlayerDiscrete(BasePlayer):
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
+        env_state = checkpoint.get('env_state', None)
+        if self.env is not None and env_state is not None:
+            self.env.set_env_state(env_state)
+
     def reset(self):
         self.init_rnn()
 
 
 class SACPlayer(BasePlayer):
+
     def __init__(self, params):
         BasePlayer.__init__(self, params)
         self.network = self.config['network']
@@ -307,11 +251,15 @@ class SACPlayer(BasePlayer):
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
-    def get_action(self, obs, is_determenistic=False):
+        env_state = checkpoint.get('env_state', None)
+        if self.env is not None and env_state is not None:
+            self.env.set_env_state(env_state)
+
+    def get_action(self, obs, is_deterministic=False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         dist = self.model.actor(obs)
-        actions = dist.sample() if is_determenistic else dist.mean
+        actions = dist.sample() if is_deterministic else dist.mean
         actions = actions.clamp(*self.action_range).to(self.device)
         if self.has_batch_dimension == False:
             actions = torch.squeeze(actions.detach())
